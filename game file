@@ -1,0 +1,359 @@
+#!/usr/bin/env node
+
+/**
+ * Backdate Commit Script
+ * Usage examples:
+ *   node backdate-commit.js --date "2025-12-10T12:00:00" --message "My commit"
+ *   node backdate-commit.js -d "2025-12-10 12:00" -m "Fix bug"
+ *   node backdate-commit.js --day Monday -m "Add feature"   (uses most recent Monday)
+ *   node backdate-commit.js --exclude "backdate-commit.js" -m "Update"
+ *   node backdate-commit.js   (defaults: message prompted, date = 7 days ago)
+ */
+
+const { exec } = require('child_process');
+
+const readline = require('readline');
+
+const WEEKDAYS = {
+    sunday: 0,
+    monday: 1,
+    tuesday: 2,
+    wednesday: 3,
+    thursday: 4,
+    friday: 5,
+    saturday: 6
+};
+
+const getMostRecentWeekdayDate = (weekdayName) => {
+    const name = weekdayName.toLowerCase();
+    const target = WEEKDAYS[name];
+    if (target === undefined) return null;
+
+    const today = new Date();
+    const todayIdx = today.getDay();
+    let diff = todayIdx - target;
+    if (diff < 0) diff += 7;
+    const d = new Date();
+    d.setDate(d.getDate() - diff);
+    d.setHours(12, 0, 0, 0);
+    return d;
+};
+
+const parseRelativeDate = (str) => {
+    if (!str || typeof str !== 'string') return null;
+    const s = str.trim().toLowerCase();
+    if (s === 'now' || s === 'today') return new Date();
+    if (s === 'yesterday') { const d = new Date(); d.setDate(d.getDate() - 1); return d; }
+
+    let m = s.match(/^(\d+)\s*days?\s*ago$/);
+    if (m) { const d = new Date(); d.setDate(d.getDate() - parseInt(m[1], 10)); return d; }
+
+    m = s.match(/^(\d+)\s*weeks?\s*ago$/);
+    if (m) { const d = new Date(); d.setDate(d.getDate() - parseInt(m[1], 10) * 7); return d; }
+
+    m = s.match(/^(\d+)\s*hours?\s*ago$/);
+    if (m) { const d = new Date(); d.setHours(d.getHours() - parseInt(m[1], 10)); return d; }
+
+    m = s.match(/^(\d+)\s*months?\s*ago$/);
+    if (m) { const d = new Date(); d.setMonth(d.getMonth() - parseInt(m[1], 10)); return d; }
+
+    return null;
+};
+
+const promptForMessage = () => {
+    return new Promise((resolve) => {
+        const rl = readline.createInterface({
+            input: process.stdin,
+            output: process.stdout
+        });
+
+        console.log('\n📝 Enter your commit message (press Enter twice to finish):');
+        const lines = [];
+        let emptyLineCount = 0;
+
+        rl.on('line', (line) => {
+            if (line.trim() === '') {
+                emptyLineCount++;
+                if (emptyLineCount >= 2) {
+                    rl.close();
+                } else {
+                    lines.push(line);
+                }
+            } else {
+                emptyLineCount = 0;
+                lines.push(line);
+            }
+        });
+
+        rl.on('close', () => {
+            resolve(lines.join('\n').trim());
+        });
+    });
+};
+
+const parseArgsAndPrompt = async () => {
+    const args = process.argv.slice(2);
+    let dateArg = null;
+    let messageArg = null;
+    let dayArg = null;
+    let excludePatterns = [];
+
+    for (let i = 0; i < args.length; i++) {
+        const a = args[i];
+        if (a === '-d' || a === '--date') {
+            dateArg = args[i + 1];
+            i++;
+        } else if (a === '-m' || a === '--message') {
+            messageArg = args[i + 1];
+            i++;
+        } else if (a === '--day') {
+            dayArg = args[i + 1];
+            i++;
+        } else if (a === '--exclude') {
+            excludePatterns.push(args[i + 1]);
+            i++;
+        } else if (!a.startsWith('-') && !dateArg) {
+            dateArg = a;
+        }
+    }
+
+    // Determine date
+    let dateObj = null;
+    if (dayArg) {
+        const d = getMostRecentWeekdayDate(dayArg);
+        if (!d) {
+            console.error('Invalid weekday name for --day');
+            process.exit(1);
+        }
+        dateObj = d;
+    } else if (dateArg) {
+        // try relative
+        const rel = parseRelativeDate(dateArg);
+        if (rel) dateObj = rel;
+        else {
+            const parsed = new Date(dateArg);
+            if (isNaN(parsed)) {
+                console.error('Invalid date. Use relative phrases like "3 days ago" or an ISO date.');
+                process.exit(1);
+            }
+            dateObj = parsed;
+        }
+    } else {
+        // default to now (original behavior)
+        dateObj = new Date();
+    }
+
+    // Do not auto-create a message here; return null so main can generate a message
+    const dateISO = new Date(dateObj).toISOString();
+    return { dateISO, message: messageArg || null, excludePatterns };
+};
+
+const generateCommitMessage = (changedFiles, dateISO) => {
+    const fileTypes = {
+        code: ['.js', '.py', '.java', '.cpp', '.c', '.go', '.rs', '.ts', '.jsx', '.tsx', '.cs'],
+        style: ['.css', '.scss', '.sass', '.less'],
+        markup: ['.html', '.xml', '.svg'],
+        data: ['.json', '.yaml', '.yml', '.csv'],
+        docs: ['.md', '.txt', '.rst'],
+        config: ['.config', '.env', '.gitignore', '.ini']
+    };
+
+    const counts = { code: 0, style: 0, markup: 0, data: 0, docs: 0, config: 0, other: 0 };
+
+    changedFiles.forEach(f => {
+        const ext = (f.includes('.') ? f.substring(f.lastIndexOf('.')).toLowerCase() : '');
+        let matched = false;
+        for (const [k, exts] of Object.entries(fileTypes)) {
+            if (exts.includes(ext)) { counts[k]++; matched = true; break; }
+        }
+        if (!matched) counts.other++;
+    });
+
+    const parts = [];
+    if (counts.code) parts.push(`${counts.code} code file(s)`);
+    if (counts.style) parts.push(`${counts.style} style file(s)`);
+    if (counts.markup) parts.push(`${counts.markup} markup file(s)`);
+    if (counts.data) parts.push(`${counts.data} data file(s)`);
+    if (counts.docs) parts.push(`${counts.docs} docs`);
+    if (counts.config) parts.push(`${counts.config} config`);
+    if (counts.other) parts.push(`${counts.other} other`);
+
+    const indicators = [
+        'Feature work',
+        'Bug fixes',
+        'Refactor and cleanup',
+        'Documentation updates',
+        'Minor improvements',
+        'Routine maintenance'
+    ];
+    const pick = indicators[Math.floor(Math.random() * indicators.length)];
+
+    const datePretty = new Date(dateISO).toLocaleString();
+
+    let header = 'Update: ';
+    if (parts.length > 0) header += parts.join(', ');
+    else header += 'misc changes';
+
+    const body = `${pick}\n\nCommitted for: ${datePretty}\n\nModified:\n${changedFiles.slice(0, 10).map(x => `- ${x}`).join('\n')}${changedFiles.length > 10 ? `\n- ...and ${changedFiles.length - 10} more` : ''}`;
+
+    return `${header}\n\n${body}\n\n🤖 Auto-generated commit`;
+};
+
+const checkGitStatus = () => {
+    return new Promise((resolve, reject) => {
+        exec('git status --porcelain', (error, stdout, stderr) => {
+            if (error) {
+                reject(error);
+                return;
+            }
+            const lines = stdout.trim().split('\n').filter(l => l.length > 0);
+            const files = lines.map(line => line.substring(3).trim());
+            resolve(files);
+        });
+    });
+};
+
+const showDiff = () => {
+    return new Promise((resolve, reject) => {
+        exec('git diff --stat', (error, stdout, stderr) => {
+            if (error) {
+                reject(error);
+                return;
+            }
+            resolve(stdout);
+        });
+    });
+};
+
+const askForConfirmation = (question) => {
+    return new Promise((resolve) => {
+        const rl = readline.createInterface({
+            input: process.stdin,
+            output: process.stdout
+        });
+
+        rl.question(question, (answer) => {
+            rl.close();
+            resolve(answer.toLowerCase().trim() === 'y' || answer.toLowerCase().trim() === 'yes');
+        });
+    });
+};
+
+const commitWithDate = (message, dateISO, excludePatterns = []) => {
+    return new Promise((resolve, reject) => {
+        let addCommand = 'git add .';
+
+        // If there are exclusions, reset and add selectively
+        if (excludePatterns.length > 0) {
+            const excludeFlags = excludePatterns.map(p => `":(exclude)${p}"`).join(' ');
+            addCommand = `git add . ${excludeFlags}`;
+        }
+
+        exec(addCommand, (addErr) => {
+            if (addErr) {
+                reject(addErr);
+                return;
+            }
+
+            const env = Object.assign({}, process.env, {
+                GIT_AUTHOR_DATE: dateISO,
+                GIT_COMMITTER_DATE: dateISO
+            });
+
+            // Escape double-quotes in message
+            const escaped = message.replace(/"/g, '\\"');
+
+            exec(`git commit -m "${escaped}"`, { env }, (err, stdout, stderr) => {
+                if (err) {
+                    if (stderr && stderr.includes('nothing to commit')) {
+                        console.log('ℹ️  No changes to commit');
+                        resolve(false);
+                    } else {
+                        reject(new Error(stderr || err.message));
+                    }
+                } else {
+                    console.log('✅ Committed with backdated timestamp:', dateISO);
+                    console.log(stdout);
+
+                    // Push to remote 'origin' branch 'main' so commit is visible remotely
+                    exec('git push origin main', { env }, (pushErr, pushOut, pushErrOut) => {
+                        if (pushErr) {
+                            console.log('⚠️  Could not push to origin main:', pushErrOut || pushErr.message);
+                            console.log('💡 Your commit is saved locally - you can push later.');
+                            resolve(true);
+                        } else {
+                            console.log('📤 Pushed to origin main successfully!');
+                            console.log(pushOut);
+                            resolve(true);
+                        }
+                    });
+                }
+            });
+        });
+    });
+};
+
+const main = async () => {
+    try {
+        console.log('\n🔁 Backdate Commit Script');
+
+        const opts = await parseArgsAndPrompt();
+        const dateISO = opts.dateISO;
+        const message = opts.message;
+        const excludePatterns = opts.excludePatterns;
+
+        if (excludePatterns.length > 0) {
+            console.log('🚫 Excluding:', excludePatterns.join(', '));
+        }
+
+        console.log('📅 Using date:', dateISO);
+        console.log('✉️  Commit message:');
+        console.log(message);
+
+        const files = await checkGitStatus();
+
+        if (!files || files.length === 0) {
+            console.log('\nℹ️  No changes found to commit');
+            return;
+        }
+
+        console.log(`\n📝 Found ${files.length} changed file(s)`);
+
+        // Show diff preview
+        console.log('\n📊 Changes to be committed:');
+        const diff = await showDiff();
+        if (diff.trim()) {
+            console.log(diff);
+        } else {
+            console.log('(No file content changes - possibly whitespace only)');
+        }
+
+        // Ask for confirmation
+        const proceed = await askForConfirmation('\n❓ Do you want to proceed with these changes? (y/n): ');
+        if (!proceed) {
+            console.log('\n❌ Commit cancelled.');
+            return;
+        }
+
+        // If message was not provided on the CLI, prompt for it
+        let finalMessage = message;
+        if (!finalMessage) {
+            finalMessage = await promptForMessage();
+            if (!finalMessage) {
+                console.log('\n❌ No commit message provided. Aborting.');
+                return;
+            }
+        }
+
+        console.log('\n💾 Creating backdated commit...\n');
+        await commitWithDate(finalMessage, dateISO, excludePatterns);
+
+        console.log('\n✨ Done.');
+    } catch (err) {
+        console.error('\n❌ Error:', err.message || err);
+        process.exit(1);
+    }
+};
+
+main();
+
